@@ -7,11 +7,15 @@ on:
         description: "Release Tag"
         required: true
       publish:
-        description: "Publish: If want ignore"
+        description: "Set to 'y' to SKIP publishing draft release"
         required: false
       artifact-pack:
-        description: "artifact-pack: If want ignore"
+        description: "Set to 'y' to SKIP the whole pack & publish job"
         required: false
+
+permissions:
+  contents: write   # 用于创建 Release
+
 jobs:
   build-go:
     strategy:
@@ -24,37 +28,44 @@ jobs:
       fail-fast: false
     runs-on: ubuntu-latest
     steps:
-      - name: Checking out sources
-        uses: actions/checkout@v3
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
       - name: Go Status
         run: git ls-files go | xargs cat | sha1sum > go_status
+
       - name: Cache Common Download
         id: cache-common
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: artifacts.tgz
           key: CommonCache-${{ matrix.cross_os }}-${{ matrix.cross_arch }}-${{ hashFiles('libs/*.sh', 'go_status', '*.txt') }}
+
       - name: Install Golang
         if: steps.cache-common.outputs.cache-hit != 'true'
-        uses: actions/setup-go@v3
+        uses: actions/setup-go@v5
         with:
-          go-version: ^1.22
+          go-version: '1.22'
+
       - name: Build golang parts
         if: steps.cache-common.outputs.cache-hit != 'true'
-        shell: bash
         run: |
           [ ${{ matrix.cross_os }} == public_res ] || ./libs/get_source.sh
           [ ${{ matrix.cross_os }} == public_res ] || GOOS=${{ matrix.cross_os }} GOARCH=${{ matrix.cross_arch }} ./libs/build_go.sh
           [ ${{ matrix.cross_os }} == public_res ] || exit 0
           ./libs/build_public_res.sh
+        shell: bash
+
       - name: Tar files
         if: steps.cache-common.outputs.cache-hit != 'true'
         run: tar czvf artifacts.tgz ./deployment
+
       - name: Uploading Artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: NekoRay-${{ github.sha }}-Common-${{ matrix.cross_os }}-${{ matrix.cross_arch }}
           path: artifacts.tgz
+
   build-cpp:
     strategy:
       matrix:
@@ -62,48 +73,49 @@ jobs:
           - platform: windows-2022
             arch: x64
             qt_version: "6.7"
-          - platform: ubuntu-20.04
+          - platform: ubuntu-20.04   # 宿主机系统，实际构建在 Docker 中进行
             arch: x64
             qt_version: "5.12"
       fail-fast: false
 
     runs-on: ${{ matrix.platform }}
-    env:
-      ACTIONS_ALLOW_UNSECURE_COMMANDS: true
     steps:
-      - name: Checking out sources
-        uses: actions/checkout@v3
+      - name: Checkout sources
+        uses: actions/checkout@v4
         with:
-          submodules: "recursive"
+          submodules: recursive
+
       - name: Install MSVC compiler
         if: matrix.platform == 'windows-2022'
         uses: ilammy/msvc-dev-cmd@v1
         with:
-          # 14.1 is for vs2017, 14.2 is vs2019, following the upstream vcpkg build from Qv2ray-deps repo
           toolset: 14.2
           arch: ${{ matrix.arch }}
-      # ========================================================================================================= Qt Install
+
+      # ================================================================== Qt Install
       - name: Windows - Download Custom Qt ${{ matrix.qt_version }} SDK
-        shell: bash
         if: matrix.platform == 'windows-2022'
         env:
           DL_QT_VER: ${{ matrix.qt_version }}
         run: bash ./libs/download_qtsdk_win.sh
-      # ========================================================================================================= 编译与 Qt 无关的依赖
+
+      # ================================================================== 编译第三方依赖
       - name: Install ninja-build tool
         uses: seanmiddleditch/gha-setup-ninja@v3
+
       - name: Cache Download
         id: cache-deps
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: libs/deps
           key: DepsCache-${{ matrix.platform }}-${{ matrix.arch }}-${{ hashFiles('libs/build_deps_*.sh') }}-Qt${{ matrix.qt_version }}
-      - name: Build Dependencies
-        shell: bash
+
+      - name: Build Dependencies (Windows)
         if: steps.cache-deps.outputs.cache-hit != 'true' && matrix.platform != 'ubuntu-20.04'
         run: ./libs/build_deps_all.sh
-      - name: Build Dependencies (Docker)
         shell: bash
+
+      - name: Build Dependencies (Linux via Docker)
         if: steps.cache-deps.outputs.cache-hit != 'true' && matrix.platform == 'ubuntu-20.04'
         run: |
           docker run --rm \
@@ -111,9 +123,9 @@ jobs:
             -w /nekoray \
             ghcr.io/matsuridayo/debian10-qt5:20230131 \
             bash -c "./libs/build_deps_all.sh"
-      # ========================================================================================================= Generate MakeFile and Build
+
+      # ================================================================== 编译本体
       - name: Windows - Generate MakeFile and Build
-        shell: bash
         if: matrix.platform == 'windows-2022'
         env:
           DL_QT_VER: ${{ matrix.qt_version }}
@@ -127,24 +139,27 @@ jobs:
           ninja -j2
           cd ..
           ./libs/deploy_windows64.sh
-      - name: Linux - Generate MakeFile and Build
         shell: bash
+
+      - name: Linux - Generate MakeFile and Build
         if: matrix.platform == 'ubuntu-20.04'
         run: |
           docker run --rm \
             -v $PWD:/nekoray \
             -w /nekoray \
             ghcr.io/matsuridayo/debian10-qt5:20230131 \
-            bash -c "mkdir build && pushd build && cmake -GNinja -DCMAKE_BUILD_TYPE=Release .. && ninja && popd &&./libs/deploy_linux64.sh"
-      # ========================================================================================================= Deployments
+            bash -c "mkdir build && pushd build && cmake -GNinja -DCMAKE_BUILD_TYPE=Release .. && ninja && popd && ./libs/deploy_linux64.sh"
+
+      # ================================================================== 上传构建产物
       - name: Tar files
-        shell: bash
         run: tar czvf artifacts.tgz ./deployment
+
       - name: Uploading Artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: NekoRay-${{ github.sha }}-${{ matrix.platform }}-${{ matrix.arch }}-Qt${{ matrix.qt_version }}
           path: artifacts.tgz
+
   publish:
     name: Pack & Publish Release
     if: github.event.inputs.artifact-pack != 'y'
@@ -153,63 +168,64 @@ jobs:
       - build-cpp
       - build-go
     steps:
-      - name: Checking out sources
-        uses: actions/checkout@v3
-      - name: Download Artifacts
-        uses: actions/download-artifact@v3
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Download all Artifacts
+        uses: actions/download-artifact@v4
         with:
           path: download-artifact
-      - name: Pack
+
+      - name: Pack standalone archives
         run: |
-          curl -Lo - https://github.com/tcnksm/ghr/releases/download/v0.13.0/ghr_v0.13.0_linux_amd64.tar.gz | tar xzv
+          curl -Lo ghr.tar.gz https://github.com/tcnksm/ghr/releases/download/v0.16.3/ghr_v0.16.3_linux_amd64.tar.gz
+          tar xzf ghr.tar.gz
           mv ghr*linux_amd64/ghr .
-          ####
           source libs/env_deploy.sh
           find . -name artifacts.tgz | xargs -n1 tar xvzf
           cd deployment
           cp -r public_res/* linux64
           cp -r public_res/* windows64
           rm -rf public_res *.pdb
-          ####
           mv linux64 nekoray
           zip -r $version_standalone-linux64.zip nekoray
           rm -rf nekoray
-          ####
           mv windows64 nekoray
           zip -r $version_standalone-windows64.zip nekoray
           rm -rf nekoray
-      - name: Pack Debian
+
+      - name: Pack Debian package
         run: |
           source libs/env_deploy.sh
           find . -name artifacts.tgz | xargs -n1 tar xvzf
           cd deployment
           cp -r public_res/* linux64
-          ####
           bash ../libs/package_debian.sh ${{ github.event.inputs.tag }}
           mv nekoray.deb $version_standalone-debian-x64.deb
-          sudo rm -rf nekoray
+
       - name: Pack AppImage
         run: |
           source libs/env_deploy.sh
           find . -name artifacts.tgz | xargs -n1 tar xvzf
           cd deployment
           cp -r public_res/* linux64
-          ####
           bash ../libs/package_appimage.sh
           mv nekobox-x86_64.AppImage $version_standalone-linux-x64.AppImage
-      - name: Clean Up
+
+      - name: Clean Up intermediates
         run: |
           cd deployment
-          rm -rf linux64
-          rm -rf windows64
-          rm -rf public_res
-          rm -rf *.pdb
-      - name: Uploading Artifact
-        uses: actions/upload-artifact@v3
+          rm -rf linux64 windows64 public_res *.pdb
+
+      - name: Upload packed artifacts (optional)
+        uses: actions/upload-artifact@v4
         with:
           name: Deployment-${{ github.sha }}
           path: deployment
-      - name: Release
+
+      - name: Create GitHub Release
         if: github.event.inputs.publish != 'y'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          ./ghr -delete -t "${{ github.token }}" -n "${{ github.event.inputs.tag }}" "${{ github.event.inputs.tag }}" deployment
+          ./ghr -delete -n "${{ github.event.inputs.tag }}" "${{ github.event.inputs.tag }}" deployment
